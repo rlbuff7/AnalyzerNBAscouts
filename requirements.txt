@@ -1,0 +1,10 @@
+nba_api==1.4.1
+requests==2.31.0
+python-dotenv==1.0.0
+rich==13.7.0
+anthropic==0.25.0
+pandas==2.1.4
+beautifulsoup4==4.12.3
+lxml==5.1.0
+cloudscraper==1.2.71
+questionary==2.1.1
