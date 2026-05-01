@@ -8,7 +8,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
-REGIONS = "eu"
+REGIONS = "us"
 MARKETS = (
     "player_points,player_rebounds,player_assists,player_threes,"
     "player_blocks,player_steals,"
@@ -16,11 +16,21 @@ MARKETS = (
     "player_points_assists,player_rebounds_assists,player_blocks_steals"
 )
 
-BOOKMAKER_PRIORITY = ["bet365", "betfair", "pinnacle", "draftkings"]
+BOOKMAKER_PRIORITY = ["draftkings", "fanduel", "bet365", "betfair", "pinnacle", "betonlineag"]
 
 MIN_EV_PERCENT = 3.0
 MIN_CONFIDENCE = 0.55
-LOOKBACK_GAMES = 10
+LOOKBACK_GAMES = 20               # Lookback expandido; decay exponencial compensa peso dos antigos
+
+# Filtros anti-contaminação de dados
+REGULAR_SEASON_SKIP_TAIL = 8      # Últimos N jogos da regular season ignorados (load management)
+MIN_MINUTES_FRACTION = 0.80       # Jogo incluído no lookback só se MIN >= fração * média da temporada
+PLAYOFF_HIST_MIN_GAMES = 5        # Mínimo de jogos históricos de playoffs para ativar o blend
+
+# Ponderação do lookback e âncora de temporada
+DECAY_FACTOR = 0.9                # Base do decay exponencial (jogo mais recente = peso 1.0)
+RECENT_WEIGHT = 0.60              # Peso da frequência recente (lookback) na prob final
+SEASON_AVG_WEIGHT = 0.40          # Peso da média da temporada (âncora) na prob final
 
 NBA_API_TIMEOUT = 30
 

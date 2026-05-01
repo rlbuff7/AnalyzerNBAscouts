@@ -251,6 +251,24 @@ def _parse_game_rows(data: dict, labels: list,
                 stats_arr = ev.get("stats")
                 if not stats_arr or len(stats_arr) < len(labels):
                     continue
+                # home/away e margem de placar para contexto de blowout
+                ha_raw = ev.get("homeAway", "") or ev.get("atVs", "") or ""
+                if ha_raw == "@":
+                    ha_raw = "away"
+                elif ha_raw == "vs":
+                    ha_raw = "home"
+
+                team_score_val = 0
+                opp_score_val = 0
+                score_str = str(ev.get("score", "") or "")
+                score_m = re.match(r"^([WL])\s+(\d+)-(\d+)", score_str.strip())
+                if score_m:
+                    team_score_val = int(score_m.group(2))
+                    opp_score_val = int(score_m.group(3))
+                elif ev.get("teamScore") is not None:
+                    team_score_val = _safe_int(ev.get("teamScore", 0))
+                    opp_score_val = _safe_int(ev.get("opponentScore", 0))
+
                 row = {
                     "PTS": _safe_int(stats_arr[pts_i]) if pts_i is not None else 0,
                     "REB": _safe_int(stats_arr[reb_i]) if reb_i is not None else 0,
@@ -262,6 +280,10 @@ def _parse_game_rows(data: dict, labels: list,
                     "MIN": _safe_float(stats_arr[min_i]) if min_i is not None else 0.0,
                     "Date": _parse_event_date(ev),
                     "IsPlayoff": is_playoffs_type,
+                    "HomeAway": ha_raw,
+                    "TeamScore": team_score_val,
+                    "OppScore": opp_score_val,
+                    "Margin": team_score_val - opp_score_val,
                 }
                 if is_playoffs_type:
                     playoff_rows.append(row)
@@ -287,19 +309,29 @@ def _add_combo_cols(df: "pd.DataFrame") -> None:
             df[combo] = numeric.sum(axis=1)
 
 
-def get_player_recent_stats(player_id, n_games: int = 10) -> dict:
+def get_player_recent_stats(player_id, n_games: int = config.LOOKBACK_GAMES) -> dict:
     empty = {
         "avg_pts": 0.0, "avg_reb": 0.0, "avg_ast": 0.0, "avg_3pm": 0.0,
         "avg_blk": 0.0, "avg_stl": 0.0,
         "avg_pra": 0.0, "avg_pr": 0.0, "avg_pa": 0.0,
         "avg_ra": 0.0, "avg_stocks": 0.0,
         "std_pts": 0.0, "std_reb": 0.0, "std_ast": 0.0,
+        "std_3pm": 0.0, "std_blk": 0.0, "std_stl": 0.0,
+        "std_pra": 0.0, "std_pr": 0.0, "std_pa": 0.0,
+        "std_ra": 0.0, "std_stocks": 0.0,
         "last_5_pts": [],
         "minutes_avg": 0.0,
         "games_played": 0,
         "df": None,
         "is_playoffs": False,
         "playoff_games": 0,
+        # Médias da temporada completa — usadas como âncora no cálculo de EV
+        "season_avg_pts": 0.0, "season_avg_reb": 0.0, "season_avg_ast": 0.0,
+        "season_avg_3pm": 0.0, "season_avg_blk": 0.0, "season_avg_stl": 0.0,
+        "season_avg_pra": 0.0, "season_avg_pr": 0.0, "season_avg_pa": 0.0,
+        "season_avg_ra": 0.0, "season_avg_stocks": 0.0,
+        "season_games": 0,
+        "team_abbr": "",
     }
     if not player_id:
         return empty
@@ -312,6 +344,11 @@ def get_player_recent_stats(player_id, n_games: int = 10) -> dict:
     labels = data.get("labels", [])
     if not labels:
         return empty
+
+    # O endpoint de gamelog retorna team como $ref; usa endpoint de atleta como fallback.
+    team_abbr = (data.get("athlete") or {}).get("team", {}).get("abbreviation", "") or ""
+    if not team_abbr:
+        team_abbr = get_player_team_abbr(str(player_id))
 
     def _idx(label: str) -> Optional[int]:
         try:
@@ -338,23 +375,76 @@ def get_player_recent_stats(player_id, n_games: int = 10) -> dict:
     playoff_rows.sort(key=lambda r: r.get("Date", "") or "")
     in_playoffs = len(playoff_rows) > 0
 
-    # Prioritise playoff games: take all playoff games + fill with recent regular season
-    if in_playoffs:
-        fill = max(0, n_games - len(playoff_rows))
-        combined = regular_rows[-fill:] + playoff_rows if fill > 0 else playoff_rows[-n_games:]
-        rows = sorted(combined, key=lambda r: r.get("Date", "") or "")
+    # --- Médias da temporada completa (todos os jogos de regular season, sem filtros) ---
+    # Usadas como âncora de longo prazo para evitar over-fit em hot/cold streaks.
+    season_df = pd.DataFrame(regular_rows) if regular_rows else pd.DataFrame()
+    if not season_df.empty:
+        _add_combo_cols(season_df)
+
+    def _season_mean(col: str) -> float:
+        if season_df.empty or col not in season_df.columns:
+            return 0.0
+        s = pd.to_numeric(season_df[col], errors="coerce").dropna()
+        return float(s.mean()) if not s.empty else 0.0
+
+    season_avgs = {
+        "season_avg_pts":    _season_mean("PTS"),
+        "season_avg_reb":    _season_mean("REB"),
+        "season_avg_ast":    _season_mean("AST"),
+        "season_avg_3pm":    _season_mean("FG3M"),
+        "season_avg_blk":    _season_mean("BLK"),
+        "season_avg_stl":    _season_mean("STL"),
+        "season_avg_pra":    _season_mean("PRA"),
+        "season_avg_pr":     _season_mean("PR"),
+        "season_avg_pa":     _season_mean("PA"),
+        "season_avg_ra":     _season_mean("RA"),
+        "season_avg_stocks": _season_mean("STOCKS"),
+        "season_games":      len(season_df),
+    }
+
+    # --- Filtro de minutos: descarta jogos com MIN < 80% da média da temporada ---
+    # Evita que jogos de load management distorçam a frequência histórica.
+    season_min_avg = _season_mean("MIN")
+    min_threshold = season_min_avg * config.MIN_MINUTES_FRACTION
+    if season_min_avg > 0:
+        filtered_reg = [r for r in regular_rows if r.get("MIN", 0.0) >= min_threshold]
     else:
-        rows = regular_rows
+        filtered_reg = list(regular_rows)
 
-    rows = rows[-n_games:]
+    # --- Pular tail da regular season (período de load management no fim da temporada) ---
+    tail = config.REGULAR_SEASON_SKIP_TAIL
+    clean_reg = filtered_reg[:-tail] if len(filtered_reg) > tail else []
 
-    # Number rows that have no date so they display as G1, G2...
-    has_dates = any(r.get("Date") for r in rows)
+    # --- Hierarquia para montar o lookback ---
+    # a) Jogos de playoffs da temporada atual (máxima prioridade, todos incluídos)
+    lookback = list(playoff_rows)
+
+    # b) Histórico de playoffs anteriores — só se houver dados suficientes
+    #    Evita contaminar o lookback com amostras esparsas de playoffs passados.
+    if in_playoffs and len(lookback) < n_games:
+        prior_rows = _get_prior_playoff_rows(player_id)
+        if len(prior_rows) >= config.PLAYOFF_HIST_MIN_GAMES:
+            fill = n_games - len(lookback)
+            prior_sorted = sorted(prior_rows, key=lambda r: r.get("Date", "") or "")
+            lookback = prior_sorted[-fill:] + lookback
+
+    # c) Regular season filtrada (sem low-minute games, sem tail de load management)
+    #    Nunca preencher com jogos do tail de regular season.
+    if len(lookback) < n_games:
+        fill = n_games - len(lookback)
+        lookback = clean_reg[-fill:] + lookback
+
+    # Limita ao tamanho do lookback e ordena cronologicamente
+    lookback = lookback[-n_games:]
+    lookback.sort(key=lambda r: r.get("Date", "") or "")
+
+    # Atribui rótulos sequenciais para jogos sem data
+    has_dates = any(r.get("Date") for r in lookback)
     if not has_dates:
-        for i, r in enumerate(rows):
+        for i, r in enumerate(lookback):
             r["Date"] = f"G{i + 1}"
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(lookback)
     _add_combo_cols(df)
 
     def _mean(col: str) -> float:
@@ -372,7 +462,30 @@ def get_player_recent_stats(player_id, n_games: int = 10) -> dict:
     last5_pts = (pd.to_numeric(df["PTS"], errors="coerce")
                  .dropna().tail(5).tolist()) if "PTS" in df.columns else []
 
-    return {
+    # Home/Away splits
+    def _split_mean(col: str, loc: str) -> float:
+        if "HomeAway" not in df.columns or col not in df.columns:
+            return 0.0
+        sub = df[df["HomeAway"] == loc]
+        if sub.empty:
+            return 0.0
+        s = pd.to_numeric(sub[col], errors="coerce").dropna()
+        return float(s.mean()) if not s.empty else 0.0
+
+    home_away_splits = {
+        "home_games": int((df["HomeAway"] == "home").sum()) if "HomeAway" in df.columns else 0,
+        "away_games": int((df["HomeAway"] == "away").sum()) if "HomeAway" in df.columns else 0,
+        "home_avg_pts": _split_mean("PTS", "home"),
+        "away_avg_pts": _split_mean("PTS", "away"),
+        "home_avg_reb": _split_mean("REB", "home"),
+        "away_avg_reb": _split_mean("REB", "away"),
+        "home_avg_ast": _split_mean("AST", "home"),
+        "away_avg_ast": _split_mean("AST", "away"),
+        "home_avg_pra": _split_mean("PRA", "home"),
+        "away_avg_pra": _split_mean("PRA", "away"),
+    }
+
+    result = {
         "avg_pts": _mean("PTS"),
         "avg_reb": _mean("REB"),
         "avg_ast": _mean("AST"),
@@ -387,24 +500,33 @@ def get_player_recent_stats(player_id, n_games: int = 10) -> dict:
         "std_pts": _std("PTS"),
         "std_reb": _std("REB"),
         "std_ast": _std("AST"),
+        "std_3pm": _std("FG3M"),
+        "std_blk": _std("BLK"),
+        "std_stl": _std("STL"),
+        "std_pra": _std("PRA"),
+        "std_pr":  _std("PR"),
+        "std_pa":  _std("PA"),
+        "std_ra":  _std("RA"),
+        "std_stocks": _std("STOCKS"),
         "last_5_pts": last5_pts,
         "minutes_avg": _mean("MIN"),
         "games_played": len(df),
         "df": df,
         "is_playoffs": in_playoffs,
         "playoff_games": len(playoff_rows),
+        "team_abbr": team_abbr,
+        "home_away_splits": home_away_splits,
     }
+    result.update(season_avgs)
+    return result
 
 
-def get_player_playoff_history(player_id, n_seasons: int = 2) -> dict:
-    """Return avg playoff stats for player over the last n_seasons previous seasons."""
-    empty = {"avg_pts": 0.0, "avg_reb": 0.0, "avg_ast": 0.0, "avg_3pm": 0.0,
-             "avg_blk": 0.0, "avg_stl": 0.0,
-             "avg_pra": 0.0, "avg_pr": 0.0, "avg_pa": 0.0,
-             "avg_ra": 0.0, "avg_stocks": 0.0, "games": 0}
-    if not player_id:
-        return empty
+def _get_prior_playoff_rows(player_id, n_seasons: int = 2) -> list:
+    """Fetch and cache raw playoff game rows from the last n_seasons prior seasons.
 
+    Shared by get_player_recent_stats (lookback hierarchy) and
+    get_player_playoff_history (aggregate averages).
+    """
     current_year = _espn_season_year()
     all_rows: list = []
 
@@ -444,6 +566,19 @@ def get_player_playoff_history(player_id, n_seasons: int = 2) -> dict:
         _write_cache(cache_path, {"rows": po_rows})
         all_rows.extend(po_rows)
 
+    return all_rows
+
+
+def get_player_playoff_history(player_id, n_seasons: int = 2) -> dict:
+    """Return avg playoff stats for player over the last n_seasons previous seasons."""
+    empty = {"avg_pts": 0.0, "avg_reb": 0.0, "avg_ast": 0.0, "avg_3pm": 0.0,
+             "avg_blk": 0.0, "avg_stl": 0.0,
+             "avg_pra": 0.0, "avg_pr": 0.0, "avg_pa": 0.0,
+             "avg_ra": 0.0, "avg_stocks": 0.0, "games": 0}
+    if not player_id:
+        return empty
+
+    all_rows = _get_prior_playoff_rows(player_id, n_seasons)
     if not all_rows:
         return empty
 
@@ -487,14 +622,27 @@ def _safe_float(v) -> float:
 
 
 def games_over_line(player_stats: dict, line: float, stat_key: str) -> float:
+    """Frequência ponderada de jogos em que o jogador superou a linha.
+
+    Usa decay exponencial: jogo mais recente tem peso 1.0, cada jogo anterior
+    multiplica por DECAY_FACTOR (0.9^i). Evita que desempenhos antigos pesem
+    tanto quanto os recentes no cálculo de probabilidade.
+    """
     df = player_stats.get("df")
     if df is None or df.empty or stat_key not in df.columns:
         return 0.0
-    series = pd.to_numeric(df[stat_key], errors="coerce").dropna()
+    # df é ordenado cronologicamente; index 0 = mais antigo, -1 = mais recente
+    series = pd.to_numeric(df[stat_key], errors="coerce").dropna().reset_index(drop=True)
     if series.empty:
         return 0.0
-    over_count = (series > line).sum()
-    return float(over_count) / len(series)
+    n = len(series)
+    # Peso i = DECAY_FACTOR^(n-1-i): índice 0 (mais antigo) → menor peso
+    weights = pd.Series([config.DECAY_FACTOR ** (n - 1 - i) for i in range(n)])
+    over_flags = (series > line).astype(float)
+    total_weight = weights.sum()
+    if total_weight == 0:
+        return 0.0
+    return float((weights * over_flags).sum() / total_weight)
 
 
 def _build_team_id_maps() -> None:
@@ -619,6 +767,20 @@ def _load_league_team_stats() -> None:
     _league_stats_loaded = True
 
 
+def _compute_dvp_ranks() -> dict:
+    """Retorna {team_name: rank} onde rank 1 = pior defesa (melhor para atacante), 30 = melhor defesa."""
+    if not _team_stats_cache:
+        return {}
+    teams_with_rating = [
+        (name, d.get("def_rating", config.LEAGUE_AVG_DEF_RATING))
+        for name, d in _team_stats_cache.items()
+        if isinstance(d, dict)
+    ]
+    # Ordena do pior (maior def_rating = concede mais) para melhor
+    teams_with_rating.sort(key=lambda x: x[1], reverse=True)
+    return {name: (i + 1) for i, (name, _) in enumerate(teams_with_rating)}
+
+
 def get_matchup_defense(team_id, position: str = "") -> dict:
     _load_league_team_stats()
 
@@ -627,6 +789,8 @@ def get_matchup_defense(team_id, position: str = "") -> dict:
         "def_rating": config.LEAGUE_AVG_DEF_RATING,
         "pace": config.LEAGUE_AVG_PACE,
         "pts_allowed_to_position": 0.0,
+        "dvp_rank": 0,
+        "dvp_total": 0,
     }
 
     if isinstance(team_id, str):
@@ -644,6 +808,9 @@ def get_matchup_defense(team_id, position: str = "") -> dict:
             "pace": cached.get("pace", config.LEAGUE_AVG_PACE),
             "opp_pts_per_game": cached.get("opp_pts_per_game", 0.0),
         })
+        ranks = _compute_dvp_ranks()
+        result["dvp_rank"] = ranks.get(team_name, 0)
+        result["dvp_total"] = len(ranks)
 
     return result
 
@@ -678,3 +845,101 @@ def get_team_roster(team_id: int) -> list[dict]:
 
 def get_player_position(player_id) -> str:
     return ""
+
+
+def get_player_team_abbr(player_id: str) -> str:
+    """Retorna a abreviação do time atual do jogador (ex: 'ORL'). Resultado cacheado por 24h."""
+    if not player_id:
+        return ""
+    cache_path = os.path.join(CACHE_DIR, f"player_team_{player_id}.json")
+    cached = _read_cache(cache_path)
+    if cached is not None:
+        return cached.get("abbr", "")
+
+    url = f"{ESPN_BASE_SITE}/athletes/{player_id}"
+    data = _espn_get(url)
+    abbr = ""
+    if data:
+        athlete = data.get("athlete") or {}
+        abbr = (athlete.get("team") or {}).get("abbreviation", "") or ""
+
+    _write_cache(cache_path, {"abbr": abbr})
+    return abbr
+
+
+INJURY_CACHE_TTL = 60 * 60  # 1h — mais fresco que o cache padrão de 24h
+
+
+def get_team_injuries(team_abbr: str) -> list[dict]:
+    """Retorna lista de {name, status} para jogadores lesionados do time.
+    Status: 'Out', 'Questionable', 'Probable', 'Day-To-Day'.
+    Cache de 1h."""
+    if not team_abbr:
+        return []
+    cache_path = os.path.join(CACHE_DIR, f"injuries_{team_abbr.upper()}.json")
+    # TTL curto: verifica mtime manualmente
+    if os.path.isfile(cache_path):
+        if time.time() - os.path.getmtime(cache_path) < INJURY_CACHE_TTL:
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f).get("injuries", [])
+            except Exception:
+                pass
+
+    url = f"{ESPN_BASE_SITE}/teams/{team_abbr.lower()}/roster"
+    data = _espn_get(url)
+    injuries: list[dict] = []
+    if data:
+        for athlete in (data.get("athletes") or []):
+            inj_list = athlete.get("injuries") or []
+            if not inj_list:
+                continue
+            status = inj_list[0].get("status", "") if inj_list else ""
+            if not status:
+                continue
+            name = athlete.get("displayName") or athlete.get("fullName") or ""
+            pid = str(athlete.get("id", ""))
+            injuries.append({"name": name, "status": status, "player_id": pid})
+
+    try:
+        _ensure_cache_dir()
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({"injuries": injuries}, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"could not cache injuries for {team_abbr}: {e}")
+
+    return injuries
+
+
+def get_team_player_ids(team_abbr: str) -> set:
+    """Retorna o conjunto de ESPN player IDs do elenco atual de um time (pela sigla, ex: 'ORL').
+    Resultado cacheado por 24h."""
+    return set(get_team_roster(team_abbr).keys())
+
+
+def get_team_roster(team_abbr: str) -> dict:
+    """Retorna {player_id: display_name} do elenco atual de um time. Cacheado por 24h."""
+    if not team_abbr:
+        return {}
+    cache_path = os.path.join(CACHE_DIR, f"roster_{team_abbr.upper()}.json")
+    cached = _read_cache(cache_path)
+    if cached is not None:
+        names = cached.get("names", {})
+        if names:
+            return names
+        # Cache antigo só com IDs — converte para o novo formato
+        return {str(i): "" for i in cached.get("ids", [])}
+
+    url = f"{ESPN_BASE_SITE}/teams/{team_abbr.lower()}/roster"
+    data = _espn_get(url)
+    roster: dict = {}
+    if data:
+        for athlete in (data.get("athletes") or []):
+            pid = str(athlete.get("id", ""))
+            name = athlete.get("displayName") or athlete.get("fullName") or ""
+            if pid:
+                roster[pid] = name
+
+    _write_cache(cache_path, {"ids": list(roster.keys()), "names": roster})
+    log.info(f"roster {team_abbr.upper()}: {len(roster)} jogadores carregados")
+    return roster

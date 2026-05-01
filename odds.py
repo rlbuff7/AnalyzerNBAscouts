@@ -1,3 +1,5 @@
+import json
+import os
 import time
 import logging
 from datetime import datetime, timedelta, timezone
@@ -8,6 +10,28 @@ import requests
 import config
 
 log = logging.getLogger(__name__)
+
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+_LINE_HISTORY_FILE = os.path.join(_CACHE_DIR, "line_history.json")
+
+
+def _load_line_history() -> dict:
+    try:
+        if os.path.isfile(_LINE_HISTORY_FILE):
+            with open(_LINE_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_line_history(hist: dict) -> None:
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        with open(_LINE_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"could not save line history: {e}")
 
 
 _quota_state = {
@@ -39,6 +63,12 @@ def _request_with_retry(url: str, params: dict, retries: int = 3) -> Optional[di
                     pass
             log.info(f"OddsAPI quota: used={used} remaining={remaining}")
 
+            if r.status_code == 401:
+                log.warning("Odds API: 401 Unauthorized — chave inválida ou plano sem player props")
+                return None  # sem retry
+            if r.status_code == 422:
+                log.warning(f"Odds API: 422 Unprocessable — parâmetros inválidos")
+                return None  # sem retry
             if r.status_code == 429:
                 log.warning(f"rate limited (429), backing off {delay}s")
                 time.sleep(delay)
@@ -96,8 +126,8 @@ def get_props_for_game(event_id: str, markets: Optional[str] = None,
         log.error("ODDS_API_KEY not set")
         return []
 
-    if _quota_state["remaining"] is not None and _quota_state["remaining"] < 10:
-        log.warning(f"quota low ({_quota_state['remaining']} left), skipping prop request")
+    if _quota_state["remaining"] is not None and _quota_state["remaining"] < 1:
+        log.warning(f"quota esgotada ({_quota_state['remaining']} left), skipping prop request")
         return []
 
     markets = markets or config.MARKETS
@@ -115,62 +145,76 @@ def get_props_for_game(event_id: str, markets: Optional[str] = None,
     if not data:
         return []
 
-    out = []
     bookmakers_list = data.get("bookmakers", [])
-
-    chosen = None
-    if bookmakers_list:
-        for preferred in config.BOOKMAKER_PRIORITY:
-            for bm in bookmakers_list:
-                if normalize_bookmaker_name(bm.get("key", "")) == preferred:
-                    chosen = bm
-                    break
-            if chosen:
-                break
-        if not chosen:
-            chosen = bookmakers_list[0]
-
-    if not chosen:
+    if not bookmakers_list:
         return []
 
-    bm_key = normalize_bookmaker_name(chosen.get("key", ""))
+    # Coleta odds de TODAS as casas: {(player, market, direction, line): {bookmaker: odd}}
+    all_data: dict = {}
+    for bm in bookmakers_list:
+        bm_key = normalize_bookmaker_name(bm.get("key", ""))
+        for market in bm.get("markets", []):
+            market_key = market.get("key")
+            for oc in market.get("outcomes", []):
+                name = oc.get("name", "")
+                description = oc.get("description") or oc.get("participant") or ""
+                point = oc.get("point")
+                price = oc.get("price")
+                player_name = description if description else name
 
-    for market in chosen.get("markets", []):
-        market_key = market.get("key")
-        outcomes = market.get("outcomes", [])
-        pairs: dict = {}
-        for oc in outcomes:
-            name = oc.get("name", "")
-            description = oc.get("description") or oc.get("participant") or ""
-            point = oc.get("point")
-            price = oc.get("price")
-            player_name = description if description else name
+                direction = None
+                if name.lower() == "over":
+                    direction = "over"
+                elif name.lower() == "under":
+                    direction = "under"
+                else:
+                    continue
 
-            direction = None
-            if name.lower() == "over":
-                direction = "over"
-            elif name.lower() == "under":
-                direction = "under"
-            else:
-                continue
+                if point is None or price is None:
+                    continue
 
-            if point is None or price is None:
-                continue
+                k = (player_name, market_key, direction, float(point))
+                all_data.setdefault(k, {})[bm_key] = float(price)
 
-            key = (player_name, point)
-            pairs.setdefault(key, {})[direction] = price
+    # Line movement: compara com a linha de abertura guardada em cache
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    line_hist = _load_line_history()
+    updated = False
 
-        for (player_name, point), sides in pairs.items():
-            for direction, odd in sides.items():
-                out.append({
-                    "player_name": player_name,
-                    "market": market_key,
-                    "line": float(point),
-                    "direction": direction,
-                    "odd_decimal": float(odd),
-                    "bookmaker": bm_key,
-                    "pair": sides,
-                })
+    out = []
+    for (player_name, market_key, direction, line), bm_odds in all_data.items():
+        best_bm = max(bm_odds, key=lambda b: bm_odds[b])
+        best_odd = bm_odds[best_bm]
+        all_odds_list = sorted(
+            [{"bookmaker": b, "odd": o} for b, o in bm_odds.items()],
+            key=lambda x: x["odd"], reverse=True,
+        )
+
+        hist_key = f"{event_id}|{player_name}|{market_key}|{direction}|{today}"
+        if hist_key not in line_hist:
+            line_hist[hist_key] = line
+            updated = True
+        opening_line = line_hist[hist_key]
+        line_movement = round(line - opening_line, 1)
+
+        out.append({
+            "player_name": player_name,
+            "market": market_key,
+            "line": line,
+            "direction": direction,
+            "odd_decimal": best_odd,
+            "bookmaker": best_bm,
+            "all_odds": all_odds_list,
+            "pair": {},
+            "line_opened": opening_line,
+            "line_movement": line_movement,
+        })
+
+    if updated:
+        # Limpa entradas de dias anteriores para não crescer indefinidamente
+        pruned = {k: v for k, v in line_hist.items() if today in k}
+        _save_line_history(pruned)
+
     return out
 
 
@@ -188,4 +232,6 @@ def normalize_bookmaker_name(name: str) -> str:
         return "draftkings"
     if "fanduel" in n:
         return "fanduel"
+    if "betonlineag" in n or "betonline" in n:
+        return "betonlineag"
     return n

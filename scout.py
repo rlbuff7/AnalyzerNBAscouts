@@ -8,10 +8,26 @@ import config
 import stats
 import odds
 import ev
+import demo as demo_module
 
 PARTIAL_RESULTS_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".cache", "partial_results.json"
 )
+
+_NBA_TOTAL_PLAYER_MIN = 240.0  # 5 jogadores × 48 min por time por jogo
+
+
+def _compute_freed_minutes(injuries: list[dict], player_stats_cache: dict) -> float:
+    """Soma avg_min dos jogadores 'Out'/'Doubtful' — minutos que serão redistribuídos."""
+    freed = 0.0
+    for inj in injuries:
+        pid = inj.get("player_id", "")
+        if not pid or inj.get("status", "") not in ("Out", "Doubtful"):
+            continue
+        if pid not in player_stats_cache:
+            player_stats_cache[pid] = stats.get_player_recent_stats(pid)
+        freed += player_stats_cache[pid].get("minutes_avg", 0.0)
+    return freed
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +125,7 @@ def analyze_day() -> list[dict]:
     player_stats_cache: dict = {}
     matchup_cache: dict = {}
     playoff_history_cache: dict = {}
+    games_with_props = 0
 
     for game_idx, m in enumerate(matched):
         event_id = m["event_id"]
@@ -123,9 +140,24 @@ def analyze_day() -> list[dict]:
         if not props:
             log.warning(f"No props returned for {away_canon} @ {home_canon}")
             continue
+        games_with_props += 1
 
         home_team_id = stats.find_team_id_by_name(home_canon)
         away_team_id = stats.find_team_id_by_name(away_canon)
+
+        # Monta roster por lado para identificar a qual time cada jogador pertence
+        home_abbr = _team_abbr(home_canon)
+        away_abbr = _team_abbr(away_canon)
+        home_player_ids = stats.get_team_player_ids(home_abbr)
+        away_player_ids = stats.get_team_player_ids(away_abbr)
+
+        # Lesões por time (cache 1h)
+        home_injuries = stats.get_team_injuries(home_abbr)
+        away_injuries = stats.get_team_injuries(away_abbr)
+
+        # Minutos liberados por desfalques — base para a cascata de minutos
+        home_freed_min = _compute_freed_minutes(home_injuries, player_stats_cache)
+        away_freed_min = _compute_freed_minutes(away_injuries, player_stats_cache)
 
         for prop in props:
             player_name = prop["player_name"]
@@ -134,6 +166,9 @@ def analyze_day() -> list[dict]:
             direction = prop["direction"]
             odd_decimal = prop["odd_decimal"]
             bookmaker = prop["bookmaker"]
+            all_odds = prop.get("all_odds", [])
+            line_movement = prop.get("line_movement", 0.0)
+            line_opened = prop.get("line_opened", prop["line"])
 
             player_id = player_stats_cache.get(("__id__", player_name))
             if player_id is None:
@@ -162,15 +197,34 @@ def analyze_day() -> list[dict]:
                 log.info(f"No game log for {player_name}")
                 continue
 
-            opponent_team_id = away_team_id
-            opponent_name = away_canon
-            if home_team_id and away_team_id:
+            # Identifica o oponente com base no roster de cada time.
+            pid_str = str(player_id)
+            if pid_str in home_player_ids:
                 opponent_team_id = away_team_id
                 opponent_name = away_canon
-
-            if opponent_team_id is None:
+                player_freed_min = home_freed_min
+            elif pid_str in away_player_ids:
                 opponent_team_id = home_team_id
                 opponent_name = home_canon
+                player_freed_min = away_freed_min
+            else:
+                # Fallback via team_abbr do gamelog ESPN
+                player_team_abbr = pstats.get("team_abbr", "").upper()
+                home_aliases = {a.upper() for a in [home_canon] + config.TEAM_NAME_MAP.get(home_canon, [])}
+                away_aliases = {a.upper() for a in [away_canon] + config.TEAM_NAME_MAP.get(away_canon, [])}
+                if player_team_abbr and player_team_abbr in home_aliases:
+                    opponent_team_id = away_team_id
+                    opponent_name = away_canon
+                    player_freed_min = home_freed_min
+                elif player_team_abbr and player_team_abbr in away_aliases:
+                    opponent_team_id = home_team_id
+                    opponent_name = home_canon
+                    player_freed_min = away_freed_min
+                else:
+                    log.warning(f"{player_name} (id={player_id}) nao encontrado no roster de {home_abbr} nem {away_abbr}")
+                    opponent_team_id = away_team_id if away_team_id else home_team_id
+                    opponent_name = away_canon if away_team_id else home_canon
+                    player_freed_min = 0.0
 
             if opponent_team_id is None:
                 log.warning(f"Could not resolve opponent team_id for {player_name}")
@@ -180,9 +234,24 @@ def analyze_day() -> list[dict]:
                 matchup_cache[opponent_team_id] = stats.get_matchup_defense(opponent_team_id)
             matchup = matchup_cache[opponent_team_id]
 
+            # Cascata de minutos: redistribui proporcionalmente os min dos desfalques
+            player_avg_min = pstats.get("minutes_avg", 0.0)
+            if player_freed_min > 0 and player_avg_min > 0:
+                active_min = max(_NBA_TOTAL_PLAYER_MIN - player_freed_min,
+                                 _NBA_TOTAL_PLAYER_MIN * 0.5)
+                projected_min = player_avg_min * (_NBA_TOTAL_PLAYER_MIN / active_min)
+            else:
+                projected_min = None
+
+            min_boost_pct = (
+                round((projected_min / player_avg_min - 1.0) * 100, 1)
+                if projected_min and player_avg_min > 0 else 0.0
+            )
+
             true_prob = ev.estimate_true_probability(
                 pstats, line, direction, matchup, market_key,
                 playoff_history=playoff_history_cache.get(player_id),
+                projected_minutes=projected_min,
             )
 
             ev_percent = ev.calculate_ev(true_prob, odd_decimal)
@@ -217,9 +286,18 @@ def analyze_day() -> list[dict]:
                 "player_blocks_steals": "STOCKS",
             }
 
+            # Lesões do time do jogador
+            pid_str2 = str(player_id)
+            if pid_str2 in home_player_ids:
+                player_team_injuries = home_injuries
+            elif pid_str2 in away_player_ids:
+                player_team_injuries = away_injuries
+            else:
+                player_team_injuries = []
+
             entries.append({
                 "player": player_name,
-                "team": "",
+                "team": pstats.get("team_abbr", ""),
                 "opponent": _team_abbr(opponent_name),
                 "game_time": _format_game_time(m["commence_time"]),
                 "market": config.MARKET_LABELS.get(market_key, market_key),
@@ -240,7 +318,22 @@ def analyze_day() -> list[dict]:
                 "pace": round(matchup.get("pace", 0.0), 2),
                 "minutes_avg": round(pstats.get("minutes_avg", 0.0), 1),
                 "bookmaker": bookmaker,
+                "all_odds": all_odds,
+                "team_injuries": player_team_injuries,
+                "dvp_rank": matchup.get("dvp_rank", 0),
+                "dvp_total": matchup.get("dvp_total", 0),
+                "line_movement": line_movement,
+                "line_opened": line_opened,
+                "projected_min": round(projected_min, 1) if projected_min else None,
+                "min_boost_pct": min_boost_pct,
             })
+
+    # Se nenhum jogo retornou props (Odds API sem plano ou quota esgotada), usa modo demo
+    if games_with_props == 0 and nba_games:
+        log.warning("Odds API não retornou props — ativando MODO DEMO com dados ESPN sintéticos")
+        entries = demo_module.generate_demo_entries(nba_games)
+        for e in entries:
+            e["_demo"] = True
 
     entries.sort(key=lambda e: e["ev_percent"], reverse=True)
     _save_partial(entries)

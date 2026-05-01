@@ -30,3 +30,9 @@ scout_run.log
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Artefatos temporários de importação de design
+.design_extract/
+design_extracted/
+nba-scout-frontend.zip
+nba_scout_design.html
